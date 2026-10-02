@@ -354,6 +354,155 @@ class UnloadingStepRow(Base):
     )
 
 
+class UnloadingExecution(Base):
+    """码头逐港卸箱执行进度（每个卸箱顺序至多一条，即每方案至多一条）。
+
+    首次现场登记（POST .../unloading/execute）时在写锁内创建，并**原子冻结**
+    当时的当前卸箱顺序及所用箱重、力臂与各港力矩区间（复制到
+    UnloadingFrozenBox/UnloadingFrozenPort）：此后同一方案修订重排原计划
+    （unloading_sequences 原子替换）不改已卸记录与后续核算；方案修订被新
+    修订取代后进度只读但仍可查询。progress_version 首次为 0，每成功登记
+    一箱递增 1，并发登记以 expected_version 原子核对。
+    """
+
+    __tablename__ = "unloading_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # 冻结时所绑定卸箱顺序 id，仅作溯源；顺序被重排删除后可能悬空，故不加外键
+    frozen_sequence_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 冻结时刻原卸箱计划的全程箱号顺序（JSON 文本，箱号列表）：
+    # 现场允许改选其他合法箱，但查询仍给出“原计划下一步”作为对照
+    frozen_plan_order: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    initial_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    # 当前剩余总力矩（每登记一箱更新）；全部卸完恒为 0
+    remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    # 进度版本：创建时为 0，每成功登记一箱 +1
+    progress_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    boxes: Mapped[list["UnloadingFrozenBox"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    ports: Mapped[list["UnloadingFrozenPort"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    steps: Mapped[list["UnloadingExecStep"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    operations: Mapped[list["UnloadingExecOperation"]] = relationship(
+        back_populates="execution", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("progress_version >= 0", name="uq_exec_version_nonneg"),
+    )
+
+
+class UnloadingFrozenBox(Base):
+    """首次登记时冻结的全程逐箱快照：箱重、槽位力臂、堆栈/层与卸港序号。"""
+
+    __tablename__ = "unloading_frozen_boxes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    slot_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+    arm: Mapped[float] = mapped_column(Float, nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    execution: Mapped[UnloadingExecution] = relationship(back_populates="boxes")
+
+    __table_args__ = (
+        UniqueConstraint("execution_id", "container_no",
+                         name="uq_frozen_box_container"),
+    )
+
+
+class UnloadingFrozenPort(Base):
+    """首次登记时冻结的各卸港允许剩余总力矩闭区间（原定区间，不再随后续重排改变）。"""
+
+    __tablename__ = "unloading_frozen_ports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    execution: Mapped[UnloadingExecution] = relationship(back_populates="ports")
+
+    __table_args__ = (
+        UniqueConstraint("execution_id", "discharge_order",
+                         name="uq_frozen_port_order"),
+    )
+
+
+class UnloadingExecStep(Base):
+    """已卸一步：自 1 起的步序、所属卸港序号、箱号与卸后剩余总力矩（含快照）。"""
+
+    __tablename__ = "unloading_exec_steps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    slot_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+    arm: Mapped[float] = mapped_column(Float, nullable=False)
+    remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    unloaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    execution: Mapped[UnloadingExecution] = relationship(back_populates="steps")
+
+    __table_args__ = (
+        UniqueConstraint("execution_id", "step_no", name="uq_exec_step_no"),
+        UniqueConstraint("execution_id", "container_no",
+                         name="uq_exec_step_container"),
+    )
+
+
+class UnloadingExecOperation(Base):
+    """现场登记操作台账：操作号全局唯一，用于重试幂等与异内容冲突识别。
+
+    同操作号同内容重试优先返回首次结果（response_snapshot 定格在首次登记后
+    的完整执行视图）；同操作号异内容冲突（409）。
+    """
+
+    __tablename__ = "unloading_exec_operations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    execution_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_executions.id", ondelete="CASCADE"), index=True
+    )
+    operation_no: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 请求内容指纹（operation_no+container_no+expected_version 规范 JSON 的 SHA-256）
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 首次登记成功后的完整执行视图快照（JSON 文本），供同操作号重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    execution: Mapped[UnloadingExecution] = relationship(back_populates="operations")
+
+
 class LoadingActuals(Base):
     """某方案修订的装船实绩登记头（每方案至多一条）。
 

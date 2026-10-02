@@ -30,6 +30,7 @@ from app.solver import (
     solve_stowage,
 )
 from app.unloader import (
+    EPS as UNLOAD_EPS,
     InfeasibleUnloading,
     PlacedContainer,
     PortWindow,
@@ -50,6 +51,15 @@ class ConflictError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+
+
+class BlockedError(Exception):
+    """所选箱合法但新状态下不存在可卸完全部剩余箱的后续（进度不变，422）。"""
+
+    def __init__(self, message: str, extra: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.extra = extra
 
 
 # ---------- 资料修订 ----------
@@ -921,6 +931,713 @@ def get_unloading_sequence(db: Session, plan_id: str) -> models.UnloadingSequenc
     if sequence is None:
         raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序", 404)
     return sequence
+
+
+# ---------- 逐港卸箱执行（现场逐步登记） ----------
+
+
+def _exec_content_hash(operation_no: str, container_no: str, expected_version: int) -> str:
+    """登记操作内容指纹：操作号 + 箱号 + 期望进度版本的规范 JSON 的 SHA-256。"""
+    payload = json.dumps(
+        {
+            "operation_no": operation_no,
+            "container_no": container_no,
+            "expected_version": expected_version,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _remaining_recommendation(remaining, windows_by_order):
+    """从当前剩余箱状态求可行的剩余推荐顺序（全程箱号字典序最小）。
+
+    remaining 为箱元组 (no, slot, stack, tier, weight, arm, order)；
+    初始总力矩按剩余箱重×力臂求和（等于已卸前缀后的当前剩余总力矩）。
+    返回 (recommendation_steps, infeasible_reason_or_None)。
+    """
+    if not remaining:
+        return [], None
+    boxes = [
+        PlacedContainer(
+            no=r[0], weight=r[4], arm=r[5], stack=r[2], tier=r[3],
+            discharge_order=r[6],
+        )
+        for r in remaining
+    ]
+    remaining_orders = sorted({r[6] for r in remaining})
+    windows = [windows_by_order[d] for d in remaining_orders]
+    initial_moment = sum(r[4] * r[5] for r in remaining)
+    try:
+        result = solve_unloading(boxes, windows)
+    except InfeasibleUnloading as exc:
+        return None, exc.reason
+    rec = [
+        {
+            "discharge_order": st.discharge_order,
+            "container_no": st.container_no,
+            "slot_code": next(
+                r[1] for r in remaining if r[0] == st.container_no
+            ),
+            "stack": st.stack,
+            "tier": st.tier,
+            "weight": st.weight,
+            "arm": st.arm,
+            "remaining_moment": st.remaining_moment,
+        }
+        for st in result.steps
+    ]
+    return rec, None
+
+
+def _execution_view_from_rows(
+    plan_id: str,
+    revision_no: int,
+    plan_status: str,
+    *,
+    frozen,
+    boxes,
+    ports,
+    steps,
+    remaining_moment,
+    progress_version,
+    frozen_at,
+    planned_steps,
+    precomputed_recommendation=None,
+):
+    """组装逐港卸箱执行进度视图（GET / 登记成功响应共用）。
+
+    * frozen=True：由首次登记冻结的 boxes/ports/steps 组装（重排/取代均不影响）；
+    * frozen=False：首次登记前，直接取当前卸箱顺序（planned_steps 含全步快照），
+      此时 progress_version=0、无已卸步骤。
+    每个 planned/exec step 为 9 元组：
+      (step_no, order, no, slot, stack, tier, weight, arm, remaining_moment[, at])
+    box 元组：(no, slot, stack, tier, weight, arm, order)
+    port 元组：(order, min, max)
+    """
+    windows_by_order = {
+        p[0]: PortWindow(
+            discharge_order=p[0],
+            min_remaining_moment=p[1],
+            max_remaining_moment=p[2],
+        )
+        for p in ports
+    }
+
+    if frozen:
+        unloaded_nos = {s[2] for s in steps}
+        remaining = tuple(b for b in boxes if b[0] not in unloaded_nos)
+        step_views = [
+            {
+                "step_no": s[0],
+                "discharge_order": s[1],
+                "container_no": s[2],
+                "slot_code": s[3],
+                "stack": s[4],
+                "tier": s[5],
+                "weight": s[6],
+                "arm": s[7],
+                "remaining_moment": s[8],
+                "unloaded_at": utc_iso(s[9]) if len(s) > 9 else None,
+            }
+            for s in sorted(steps, key=lambda x: x[0])
+        ]
+    else:
+        # 首次登记前：无已卸步骤，全部箱均剩余
+        unloaded_nos = set()
+        remaining = tuple(boxes)
+        remaining_moment = sum(b[4] * b[5] for b in boxes)
+        progress_version = 0
+        step_views = []
+
+    current_port = min((b[6] for b in remaining), default=None)
+
+    # 原计划下一步：按冻结的原计划箱号顺序，取第一个尚未卸下的箱
+    # （现场可偏离原计划，故不能简单地以“已卸数量+1”定位）
+    planned_next = None
+    for s in planned_steps:
+        if frozen and s[2] in unloaded_nos:
+            continue
+        planned_next = s[2]
+        break
+
+    if precomputed_recommendation is not None:
+        # 首次登记前：推荐顺序即已求解并保存的原计划，直接复用，不再求解
+        recommendation = precomputed_recommendation
+        blocked_reason = None
+    else:
+        recommendation, blocked_reason = _remaining_recommendation(
+            remaining, windows_by_order
+        )
+    completed = len(remaining) == 0
+    read_only = plan_status == "superseded" or completed
+
+    return {
+        "plan_id": plan_id,
+        "revision_no": revision_no,
+        "status": "historical" if plan_status == "superseded" else "current",
+        "read_only": read_only,
+        "completed": completed,
+        "progress_version": progress_version,
+        "initial_moment": round(sum(b[4] * b[5] for b in boxes), 6),
+        "remaining_moment": round(remaining_moment, 6),
+        "current_port": current_port,
+        "planned_next_container": planned_next,
+        "frozen": frozen,
+        "frozen_at": utc_iso(frozen_at) if frozen_at is not None else None,
+        "steps": step_views,
+        "recommendation": recommendation if recommendation is not None else [],
+        # 仅供服务内部在“被阻碍”场景下读取原因，不随响应输出
+        "_blocked_reason": blocked_reason,
+    }
+
+
+def get_unloading_execution(db: Session, plan_id: str) -> dict:
+    """查询逐港卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与推荐顺序。
+
+    首次登记前且存在当前卸箱顺序：返回 version=0 的未冻结预览（原计划推荐）；
+    无卸箱顺序（或方案不存在）：404。首次登记后一律以冻结快照核算，方案被
+    取代仍可查询（status=historical、read_only=true）。
+    """
+    plan = get_plan(db, plan_id)
+    execution = db.scalar(
+        select(models.UnloadingExecution).where(
+            models.UnloadingExecution.plan_id == plan_id
+        )
+    )
+
+    if execution is None:
+        sequence = db.scalar(
+            select(models.UnloadingSequence).where(
+                models.UnloadingSequence.plan_id == plan_id
+            )
+        )
+        if sequence is None:
+            raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序，无执行进度", 404)
+        boxes = tuple(
+            (
+                st.container_no,
+                st.slot_code,
+                st.stack,
+                st.tier,
+                st.weight,
+                st.arm,
+                st.discharge_order,
+            )
+            for st in sequence.steps
+        )
+        ports = tuple(
+            (p.discharge_order, p.min_remaining_moment, p.max_remaining_moment)
+            for p in sequence.ports
+        )
+        planned_steps = tuple(
+            (
+                st.step_no,
+                st.discharge_order,
+                st.container_no,
+                st.slot_code,
+                st.stack,
+                st.tier,
+                st.weight,
+                st.arm,
+                st.remaining_moment,
+            )
+            for st in sorted(sequence.steps, key=lambda x: x.step_no)
+        )
+        precomputed = [
+            {
+                "discharge_order": s[1],
+                "container_no": s[2],
+                "slot_code": s[3],
+                "stack": s[4],
+                "tier": s[5],
+                "weight": s[6],
+                "arm": s[7],
+                "remaining_moment": s[8],
+            }
+            for s in planned_steps
+        ]
+        return _execution_view_from_rows(
+            plan_id,
+            plan.revision_no,
+            plan.status,
+            frozen=False,
+            boxes=boxes,
+            ports=ports,
+            steps=(),
+            remaining_moment=sequence.initial_moment,
+            progress_version=0,
+            frozen_at=None,
+            planned_steps=planned_steps,
+            precomputed_recommendation=precomputed,
+        )
+
+    boxes, ports, steps, planned_steps = _frozen_state_rows(execution)
+    return _execution_view_from_rows(
+        plan.id,
+        plan.revision_no,
+        plan.status,
+        frozen=True,
+        boxes=boxes,
+        ports=ports,
+        steps=steps,
+        remaining_moment=execution.remaining_moment,
+        progress_version=execution.progress_version,
+        frozen_at=execution.frozen_at,
+        planned_steps=planned_steps,
+    )
+
+
+def _frozen_state_rows(execution):
+    """从冻结快照读取 (boxes, ports, steps, planned_steps) 元组集合。
+
+    元组结构见 _execution_view_from_rows；planned_steps 的剩余力矩列对原计划
+    无对照意义，置 0。
+    """
+    boxes = tuple(
+        (
+            b.container_no,
+            b.slot_code,
+            b.stack,
+            b.tier,
+            b.weight,
+            b.arm,
+            b.discharge_order,
+        )
+        for b in sorted(execution.boxes, key=lambda x: x.container_no)
+    )
+    ports = tuple(
+        (p.discharge_order, p.min_remaining_moment, p.max_remaining_moment)
+        for p in sorted(execution.ports, key=lambda x: x.discharge_order)
+    )
+    steps = tuple(
+        (
+            s.step_no,
+            s.discharge_order,
+            s.container_no,
+            s.slot_code,
+            s.stack,
+            s.tier,
+            s.weight,
+            s.arm,
+            s.remaining_moment,
+            s.unloaded_at,
+        )
+        for s in sorted(execution.steps, key=lambda x: x.step_no)
+    )
+    box_by_no = {b[0]: b for b in boxes}
+    planned_steps = tuple(
+        (
+            idx,
+            box_by_no[no][6],
+            no,
+            box_by_no[no][1],
+            box_by_no[no][2],
+            box_by_no[no][3],
+            box_by_no[no][4],
+            box_by_no[no][5],
+            0.0,
+        )
+        for idx, no in enumerate(json.loads(execution.frozen_plan_order), start=1)
+    )
+    return boxes, ports, steps, planned_steps
+
+
+def execute_unloading_step(
+    db: Session,
+    plan_id: str,
+    payload,
+) -> tuple[dict, bool]:
+    """现场登记卸下一箱，返回 (执行进度视图, 是否为同操作号重试)。
+
+    每次提交方案号（路径）、箱号、全局唯一操作号与期望进度版本。当前港取
+    剩余箱中最小卸港序号；所选箱须属于该港且位于同堆栈最上层；卸后剩余
+    力矩须落入该港原定闭区间；且只有从新状态仍能按港序、堆栈先后和各港
+    力矩区间卸完全部剩余箱时才登记（否则说明阻碍且进度不变，422）。
+    首次登记冻结当时卸箱计划及所用箱重、力臂和港区间；此后重排原计划不改
+    已卸记录与后续核算。方案被新修订取代后只读（409），历史进度仍可查。
+    同操作号同内容重试优先返回首次结果（200），异内容冲突（409）。
+    """
+    plan = get_plan(db, plan_id)
+    container_no = payload.container_no
+    operation_no = payload.operation_no
+    expected_version = payload.expected_version
+    content_hash = _exec_content_hash(operation_no, container_no, expected_version)
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    snapshot = None
+    try:
+        # 可行性复核可能调用 MILP（最长 TIME_LIMIT 秒）且发生在写锁内，
+        # 放宽该连接的锁等待，避免并发登记立刻 SQLITE_BUSY
+        cursor.execute("PRAGMA busy_timeout=60000")
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 锁内复核方案状态：方案被新修订取代后执行进度只读
+        cursor.execute("SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,))
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked, revision_no_locked = prow
+        if plan_status_locked == "draft":
+            conn.rollback()
+            raise ConflictError("方案尚未确认（draft），尚无卸箱计划，拒绝登记卸箱")
+        read_only_plan = plan_status_locked == "superseded"
+
+        # 同操作号全局唯一：同内容重试即使方案已取代/已全部卸完也返回首次结果；
+        # 异内容（含复用至另一方案）一律冲突。
+        cursor.execute(
+            "SELECT execution_id, content_hash, response_snapshot "
+            "FROM unloading_exec_operations WHERE operation_no = ?",
+            (operation_no,),
+        )
+        op = cursor.fetchone()
+        if op is not None:
+            op_exec_id, op_hash, op_snapshot = op
+            if op_hash != content_hash:
+                conn.rollback()
+                raise ConflictError(
+                    f"操作号 {operation_no} 已用于不同内容的卸箱登记，"
+                    "同操作号异内容冲突，本次登记被拒绝且进度不变"
+                )
+            if op_exec_id is not None:
+                cursor.execute(
+                    "SELECT plan_id FROM unloading_executions WHERE id = ?",
+                    (op_exec_id,),
+                )
+                erow = cursor.fetchone()
+                if erow is None or erow[0] != plan_id:
+                    conn.rollback()
+                    raise ConflictError(
+                        f"操作号 {operation_no} 已用于另一方案的卸箱登记，"
+                        "同操作号异内容冲突，本次登记被拒绝且进度不变"
+                    )
+            idempotent_hit = True
+            conn.commit()
+            snapshot = json.loads(op_snapshot)
+        else:
+            snapshot = _register_unloading_step(
+                cursor,
+                plan_id=plan_id,
+                revision_no=revision_no_locked,
+                plan_superseded=read_only_plan,
+                container_no=container_no,
+                operation_no=operation_no,
+                expected_version=expected_version,
+                content_hash=content_hash,
+            )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return snapshot, idempotent_hit
+
+
+def _register_unloading_step(
+    cursor,
+    *,
+    plan_id,
+    revision_no,
+    plan_superseded,
+    container_no,
+    operation_no,
+    expected_version,
+    content_hash,
+):
+    """写锁内完成单次卸箱登记的全部核对与写入；任何拒绝均在调用方回滚。"""
+    if plan_superseded:
+        raise ConflictError(
+            "方案修订已被新修订取代，其卸箱执行进度已冻结为只读，"
+            "不再接受登记；历史进度仍可查询"
+        )
+
+    cursor.execute(
+        "SELECT id, remaining_moment, progress_version "
+        "FROM unloading_executions WHERE plan_id = ?",
+        (plan_id,),
+    )
+    head = cursor.fetchone()
+
+    if head is None:
+        # 首次登记：必须存在当前卸箱计划，无则拒绝；并冻结计划/箱重/力臂/港区间
+        cursor.execute(
+            "SELECT id, initial_moment FROM unloading_sequences "
+            "WHERE plan_id = ? AND status = 'current'",
+            (plan_id,),
+        )
+        seq_row = cursor.fetchone()
+        if seq_row is None:
+            raise ConflictError(
+                f"方案 {plan_id} 没有当前卸箱计划，须先生成逐港卸箱顺序，"
+                "方可登记现场卸箱"
+            )
+        if expected_version != 0:
+            raise ConflictError(
+                f"尚无执行进度（首次进度版本为 0），提交的期望进度版本 "
+                f"{expected_version} 已过期，本次登记被拒绝且进度不变"
+            )
+        sequence_id, initial_moment = seq_row
+        plan_steps_present = _sequence_step_tuples(cursor, sequence_id)
+        if not plan_steps_present:
+            # 空箱方案：无箱可卸，执行进度天然完结，不创建冻结头
+            raise ConflictError("该卸箱计划为空箱方案（无箱可卸），不接受卸箱登记")
+        plan_order = [s[2] for s in plan_steps_present]
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO unloading_executions "
+            "(plan_id, frozen_sequence_id, frozen_plan_order, initial_moment, "
+            "remaining_moment, progress_version, frozen_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                plan_id, sequence_id,
+                json.dumps(plan_order, ensure_ascii=False),
+                initial_moment, initial_moment, now, now,
+            ),
+        )
+        exec_id = cursor.lastrowid
+        # 冻结当时计划所用箱重、槽位力臂、堆栈/层与卸港序号
+        cursor.execute(
+            "INSERT INTO unloading_frozen_boxes "
+            "(execution_id, container_no, slot_code, stack, tier, weight, "
+            "arm, discharge_order) "
+            "SELECT ?, container_no, slot_code, stack, tier, weight, arm, "
+            "discharge_order FROM unloading_steps WHERE sequence_id = ?",
+            (exec_id, sequence_id),
+        )
+        # 冻结各卸港原定剩余力矩闭区间
+        cursor.execute(
+            "INSERT INTO unloading_frozen_ports "
+            "(execution_id, discharge_order, min_remaining_moment, "
+            "max_remaining_moment) "
+            "SELECT ?, discharge_order, min_remaining_moment, "
+            "max_remaining_moment FROM unloading_ports WHERE sequence_id = ?",
+            (exec_id, sequence_id),
+        )
+        remaining_moment = initial_moment
+        progress_version = 0
+    else:
+        exec_id, remaining_moment, progress_version = head
+        if expected_version != progress_version:
+            raise ConflictError(
+                f"期望进度版本 {expected_version} 与当前进度版本 "
+                f"{progress_version} 不一致（版本过期或并发登记已推进），"
+                "本次登记被拒绝且进度不变"
+            )
+
+    boxes_all = _exec_box_tuples(cursor, exec_id)
+    ports_all = _exec_port_tuples(cursor, exec_id)
+    steps_all = _exec_step_tuples(cursor, exec_id)
+    box_by_no = {b[0]: b for b in boxes_all}
+    window_by_order = {p[0]: p for p in ports_all}
+    unloaded_nos = {s[2] for s in steps_all}
+    remaining_boxes = [b for b in boxes_all if b[0] not in unloaded_nos]
+
+    if not remaining_boxes:
+        raise ConflictError("全部箱已卸完，执行进度已完结，不再接受登记")
+
+    # 非法箱项（422，进度不变）
+    chosen = box_by_no.get(container_no)
+    if chosen is None:
+        raise BusinessError(
+            f"箱 {container_no} 不在冻结卸箱计划中（非法箱项），拒绝登记", 422
+        )
+    if chosen[0] in unloaded_nos:
+        raise BusinessError(
+            f"箱 {container_no} 已经卸下，不得重复卸箱，拒绝登记", 422
+        )
+    current_port = min(b[6] for b in remaining_boxes)
+    if chosen[6] != current_port:
+        port_boxes = ", ".join(
+            sorted(b[0] for b in remaining_boxes if b[6] == current_port)
+        )
+        raise BusinessError(
+            f"当前港为卸港序号 {current_port}，所选箱 {container_no} 属于卸港 "
+            f"{chosen[6]}，不属当前港，拒绝登记；当前港剩余箱：{port_boxes}",
+            422,
+        )
+    # 同堆栈最上层：剩余箱中同栈最大 tier 即栈顶（已卸箱不参与）
+    stack_top = max(
+        (b for b in remaining_boxes if b[2] == chosen[2]), key=lambda b: b[3]
+    )
+    if chosen[0] != stack_top[0]:
+        raise BusinessError(
+            f"箱 {container_no} 不是堆栈 {chosen[2]} 的最上层剩余箱"
+            f"（栈顶为 {stack_top[0]}），上层箱未卸不得取下下层箱，拒绝登记",
+            422,
+        )
+
+    # 卸后剩余总力矩须落入该港原定闭区间（容差随量级缩放，与求解器一致）
+    new_remaining_moment = round(remaining_moment - chosen[4] * chosen[5], 6)
+    wmin, wmax = window_by_order[current_port][1], window_by_order[current_port][2]
+    scale = max(1.0, abs(remaining_moment), abs(wmin), abs(wmax))
+    if not (wmin - UNLOAD_EPS * scale <= new_remaining_moment
+            <= wmax + UNLOAD_EPS * scale):
+        raise BusinessError(
+            f"卸下 {container_no} 后剩余总力矩 {new_remaining_moment} 不在当前港"
+            f"（卸港序号 {current_port}）原定允许区间 [{wmin}, {wmax}] 内，"
+            "拒绝登记",
+            422,
+        )
+
+    # 可行性：从新状态仍须能按港序、堆栈先后与各港力矩区间卸完全部剩余箱
+    next_remaining = tuple(b for b in remaining_boxes if b[0] != container_no)
+    next_windows = {
+        d: PortWindow(
+            discharge_order=d,
+            min_remaining_moment=p[1],
+            max_remaining_moment=p[2],
+        )
+        for d, p in window_by_order.items()
+    }
+    recommendation, blocked_reason = _remaining_recommendation(
+        next_remaining, next_windows
+    )
+    if recommendation is None:
+        raise BlockedError(
+            f"卸下 {container_no} 虽合法，但从新状态无法再按卸港顺序、堆栈"
+            "先后与各港剩余力矩区间卸完全部剩余箱，本次登记被拒绝且进度不变；"
+            f"阻碍原因：{blocked_reason}",
+            extra={
+                "container_no": container_no,
+                "current_port": current_port,
+                "remaining_moment_after": new_remaining_moment,
+                "blocked_reason": blocked_reason,
+            },
+        )
+
+    # 登记本步并推进版本（原子提交；任何异常由调用方整批回滚，不留部分进度）
+    new_step_no = len(steps_all) + 1
+    ts = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+    cursor.execute(
+        "INSERT INTO unloading_exec_steps "
+        "(execution_id, step_no, discharge_order, container_no, slot_code, "
+        "stack, tier, weight, arm, remaining_moment, unloaded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            exec_id, new_step_no, current_port, chosen[0], chosen[1], chosen[2],
+            chosen[3], chosen[4], chosen[5], new_remaining_moment, ts,
+        ),
+    )
+    cursor.execute(
+        "UPDATE unloading_executions SET remaining_moment = ?, "
+        "progress_version = ? WHERE id = ?",
+        (new_remaining_moment, progress_version + 1, exec_id),
+    )
+
+    # 同一锁内组装首次结果快照并登记操作台账
+    snapshot = _locked_execution_view(
+        cursor, exec_id, plan_id, revision_no, plan_status="confirmed"
+    )
+    cursor.execute(
+        "INSERT INTO unloading_exec_operations "
+        "(execution_id, operation_no, container_no, expected_version, "
+        "content_hash, response_snapshot, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            exec_id, operation_no, container_no, expected_version,
+            content_hash, json.dumps(snapshot, ensure_ascii=False), ts,
+        ),
+    )
+    return snapshot
+
+
+def _sequence_step_tuples(cursor, sequence_id):
+    cursor.execute(
+        "SELECT step_no, discharge_order, container_no, slot_code, stack, tier, "
+        "weight, arm, remaining_moment FROM unloading_steps "
+        "WHERE sequence_id = ? ORDER BY step_no",
+        (sequence_id,),
+    )
+    return [tuple(r) for r in cursor.fetchall()]
+
+
+def _exec_box_tuples(cursor, exec_id):
+    cursor.execute(
+        "SELECT container_no, slot_code, stack, tier, weight, arm, discharge_order "
+        "FROM unloading_frozen_boxes WHERE execution_id = ? ORDER BY container_no",
+        (exec_id,),
+    )
+    return [tuple(r) for r in cursor.fetchall()]
+
+
+def _exec_port_tuples(cursor, exec_id):
+    cursor.execute(
+        "SELECT discharge_order, min_remaining_moment, max_remaining_moment "
+        "FROM unloading_frozen_ports WHERE execution_id = ? ORDER BY discharge_order",
+        (exec_id,),
+    )
+    return [tuple(r) for r in cursor.fetchall()]
+
+
+def _exec_step_tuples(cursor, exec_id):
+    cursor.execute(
+        "SELECT step_no, discharge_order, container_no, slot_code, stack, tier, "
+        "weight, arm, remaining_moment, unloaded_at FROM unloading_exec_steps "
+        "WHERE execution_id = ? ORDER BY step_no",
+        (exec_id,),
+    )
+    return [
+        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], _raw_dt(r[9]))
+        for r in cursor.fetchall()
+    ]
+
+
+def _locked_execution_view(cursor, exec_id, plan_id, revision_no, plan_status):
+    """写锁内组装执行进度视图（与 GET 视图同构），用于操作成功快照。"""
+    cursor.execute(
+        "SELECT remaining_moment, progress_version, frozen_at, frozen_plan_order "
+        "FROM unloading_executions WHERE id = ?",
+        (exec_id,),
+    )
+    rem, ver, frozen_at, plan_order_json = cursor.fetchone()
+    frozen_at = _raw_dt(frozen_at)
+    boxes = tuple(_exec_box_tuples(cursor, exec_id))
+    ports = tuple(_exec_port_tuples(cursor, exec_id))
+    steps = tuple(_exec_step_tuples(cursor, exec_id))
+    box_by_no = {b[0]: b for b in boxes}
+    planned_steps = tuple(
+        (
+            idx,
+            box_by_no[no][6],
+            no,
+            box_by_no[no][1],
+            box_by_no[no][2],
+            box_by_no[no][3],
+            box_by_no[no][4],
+            box_by_no[no][5],
+            0.0,
+        )
+        for idx, no in enumerate(json.loads(plan_order_json), start=1)
+    )
+    view = _execution_view_from_rows(
+        plan_id,
+        revision_no,
+        plan_status,
+        frozen=True,
+        boxes=boxes,
+        ports=ports,
+        steps=steps,
+        remaining_moment=rem,
+        progress_version=ver,
+        frozen_at=frozen_at,
+        planned_steps=planned_steps,
+    )
+    view.pop("_blocked_reason", None)
+    return view
+
+
+
 
 
 # ---------- 装船实绩登记（事件重放） ----------

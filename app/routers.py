@@ -30,6 +30,8 @@ from app.schemas import (
     SlotDataIn,
     SlotRevisionOut,
     UnloadingCreateIn,
+    UnloadingExecuteIn,
+    UnloadingExecutionOut,
     UnloadingOut,
     UnloadingPortOut,
     UnloadingStepOut,
@@ -368,6 +370,43 @@ def list_unloading_sequences(
 )
 def get_unloading_sequence(plan_id: str, db: Session = Depends(get_db)):
     return _unloading_out(services.get_unloading_sequence(db, plan_id))
+
+
+# ---------- 逐港卸箱执行（现场逐步登记） ----------
+
+
+def _strip_internal(view: dict) -> dict:
+    """去掉服务内部字段，得到对外执行进度视图。"""
+    return {k: v for k, v in view.items() if not k.startswith("_")}
+
+
+@router.post(
+    "/plans/{plan_id}/unloading/execute",
+    response_model=UnloadingExecutionOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="现场登记卸下一箱（可偏离原计划；原子核对期望版本，成功后返回剩余推荐顺序）",
+)
+def execute_unloading_step(
+    plan_id: str,
+    body: UnloadingExecuteIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    view, idempotent_hit = services.execute_unloading_step(db, plan_id, body)
+    # 同操作号同内容重试返回首次结果（200）；新登记成功为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return _strip_internal(view)
+
+
+@router.get(
+    "/plans/{plan_id}/unloading/execution",
+    response_model=UnloadingExecutionOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与推荐顺序",
+)
+def get_unloading_execution(plan_id: str, db: Session = Depends(get_db)):
+    return _strip_internal(services.get_unloading_execution(db, plan_id))
 
 
 # ---------- 装船实绩登记（事件重放） ----------

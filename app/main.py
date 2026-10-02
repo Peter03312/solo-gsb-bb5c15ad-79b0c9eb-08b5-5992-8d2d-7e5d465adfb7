@@ -14,7 +14,7 @@ from app import __version__
 from app.config import get_settings
 from app.database import init_db
 from app.routers import router
-from app.services import BusinessError, ConflictError
+from app.services import BlockedError, BusinessError, ConflictError
 
 settings = get_settings()
 
@@ -57,6 +57,15 @@ def _business_handler(_request: Request, exc: BusinessError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def _conflict_handler(_request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": exc.message})
+
+
+@app.exception_handler(BlockedError)
+def _blocked_handler(_request: Request, exc: BlockedError) -> JSONResponse:
+    # 所选箱合法但新状态无可行后续：422（业务不可处理），进度保持不变
+    content = {"detail": exc.message}
+    if getattr(exc, "extra", None):
+        content.update(exc.extra)
+    return JSONResponse(status_code=422, content=content)
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")

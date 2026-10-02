@@ -333,6 +333,82 @@ class UnloadingOut(BaseModel):
     created_at: str
 
 
+# ---------- 逐港卸箱执行（现场逐步登记） ----------
+
+
+class UnloadingExecuteIn(BaseModel):
+    """现场卸一箱的登记请求：方案号取路径参数。"""
+
+    container_no: str = Field(..., description="本次实际卸下的箱号（须属当前港且位于同堆栈最上层）")
+    operation_no: str = Field(..., description="全局唯一操作号；同号同内容重试返回首次结果，同号异内容冲突")
+    expected_version: int = Field(
+        ..., ge=0, description="期望进度版本；首次为 0，每次成功登记后 +1；与当前不一致返回 409"
+    )
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @field_validator("operation_no")
+    @classmethod
+    def _operation_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "操作号")
+
+
+class UnloadingExecStepOut(BaseModel):
+    """已卸一步（含方案所用箱重、槽位力臂与卸后剩余总力矩）。"""
+
+    step_no: int
+    discharge_order: int
+    container_no: str
+    slot_code: str
+    stack: str
+    tier: int
+    weight: float
+    arm: float
+    remaining_moment: float
+    unloaded_at: str | None = None
+
+
+class UnloadingRecommendedStepOut(BaseModel):
+    """从当前状态出发、可行的剩余推荐顺序中的一步（全程箱号字典序最小）。"""
+
+    discharge_order: int
+    container_no: str
+    slot_code: str
+    stack: str
+    tier: int
+    weight: float
+    arm: float
+    remaining_moment: float
+
+
+class UnloadingExecutionOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(
+        ..., description="current=方案修订仍当前；historical=方案修订已被新修订取代（只读）"
+    )
+    read_only: bool = Field(..., description="true=方案已被取代/全部卸完，不再接受登记")
+    completed: bool = Field(..., description="true=全部剩余箱已卸完")
+    progress_version: int = Field(..., description="进度版本：首次登记前为 0，每登记一箱 +1")
+    initial_moment: float
+    remaining_moment: float = Field(..., description="当前剩余总力矩")
+    current_port: int | None = Field(
+        ..., description="当前港：剩余箱中最小卸港序号；无剩余箱为 null"
+    )
+    planned_next_container: str | None = Field(
+        ..., description="冻结的原计划下一步箱号（允许现场改选其他合法箱）；无剩余为 null"
+    )
+    frozen: bool = Field(..., description="true=计划及箱重/力臂/港区间已被首次登记冻结")
+    frozen_at: str | None = None
+    steps: list[UnloadingExecStepOut]
+    recommendation: list[UnloadingRecommendedStepOut] = Field(
+        ..., description="从当前状态出发可行的剩余推荐顺序；全部卸完为空"
+    )
+
+
 # ---------- 装船实绩登记（事件重放） ----------
 
 
