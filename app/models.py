@@ -354,6 +354,160 @@ class UnloadingStepRow(Base):
     )
 
 
+class UnloadingProgress(Base):
+    """某方案修订的卸箱执行进度头（每方案至多一条）。
+
+    首次登记时原子冻结当时的当前逐港卸箱计划：各箱箱重/槽位力臂/堆栈层位/
+    卸港序号快照（UnloadingProgressContainer）与各港允许剩余总力矩闭区间
+    （UnloadingProgressPort）。此后原计划被重排（卸箱顺序原子替换）不改已卸
+    记录与后续核算；方案修订被新修订取代（superseded）后进度只读、仍可查询。
+    进度版本即已卸步数：首次登记前视为 0，每成功登记一步递增 1。
+    """
+
+    __tablename__ = "unloading_progress"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # 进度版本：等于已卸步数；首次成功登记后为 1，每步递增 1
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # 冻结时计划的初始剩余总力矩（全部箱未卸时）
+    initial_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    frozen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    containers: Mapped[list["UnloadingProgressContainer"]] = relationship(
+        back_populates="progress", cascade="all, delete-orphan"
+    )
+    ports: Mapped[list["UnloadingProgressPort"]] = relationship(
+        back_populates="progress", cascade="all, delete-orphan"
+    )
+    steps: Mapped[list["UnloadingProgressStep"]] = relationship(
+        back_populates="progress", cascade="all, delete-orphan"
+    )
+    operations: Mapped[list["UnloadingProgressOperation"]] = relationship(
+        back_populates="progress", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_unloading_progress_version"),
+    )
+
+
+class UnloadingProgressContainer(Base):
+    """首次登记时冻结的箱快照：箱重、槽位力臂、堆栈层位与卸港序号。"""
+
+    __tablename__ = "unloading_progress_containers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    progress_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_progress.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    slot_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight: Mapped[float] = mapped_column(Float, nullable=False)
+    arm: Mapped[float] = mapped_column(Float, nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    progress: Mapped[UnloadingProgress] = relationship(back_populates="containers")
+
+    __table_args__ = (
+        UniqueConstraint("progress_id", "container_no",
+                         name="uq_unloading_progress_container"),
+    )
+
+
+class UnloadingProgressPort(Base):
+    """首次登记时冻结的各卸港允许剩余总力矩闭区间（原定区间）。"""
+
+    __tablename__ = "unloading_progress_ports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    progress_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_progress.id", ondelete="CASCADE"), index=True
+    )
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    max_remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+
+    progress: Mapped[UnloadingProgress] = relationship(back_populates="ports")
+
+    __table_args__ = (
+        UniqueConstraint("progress_id", "discharge_order",
+                         name="uq_unloading_progress_port"),
+    )
+
+
+class UnloadingProgressStep(Base):
+    """已登记卸下的一步：箱号、操作号与卸后剩余总力矩（只追加）。"""
+
+    __tablename__ = "unloading_progress_steps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    progress_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_progress.id", ondelete="CASCADE"), index=True
+    )
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    discharge_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    remaining_moment: Mapped[float] = mapped_column(Float, nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    progress: Mapped[UnloadingProgress] = relationship(back_populates="steps")
+
+    __table_args__ = (
+        UniqueConstraint("progress_id", "step_no",
+                         name="uq_unloading_progress_step_no"),
+        UniqueConstraint("progress_id", "container_no",
+                         name="uq_unloading_progress_step_container"),
+        CheckConstraint("step_no >= 1", name="ck_unloading_progress_step_no"),
+        CheckConstraint("expected_version >= 0",
+                        name="ck_unloading_progress_step_expected"),
+    )
+
+
+class UnloadingProgressOperation(Base):
+    """一次已成功登记的卸箱操作（操作号全局唯一，支持幂等重试）。
+
+    首次登记成功后的完整查询结果序列化存入 response_snapshot；同操作号同内容
+    （同方案、同箱号、同期望版本）重试直接返回该快照、不重复生效；同操作号
+    异内容冲突（409），进度不变。
+    """
+
+    __tablename__ = "unloading_progress_operations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    progress_id: Mapped[int] = mapped_column(
+        ForeignKey("unloading_progress.id", ondelete="CASCADE"), index=True
+    )
+    operation_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 首次登记成功后的完整 UnloadingProgressOut 快照（JSON 文本），供重试幂等返回
+    response_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    progress: Mapped[UnloadingProgress] = relationship(back_populates="operations")
+
+    __table_args__ = (
+        UniqueConstraint("operation_no", name="uq_unloading_operation_no"),
+    )
+
+
 class LoadingActuals(Base):
     """某方案修订的装船实绩登记头（每方案至多一条）。
 

@@ -30,6 +30,7 @@ from app.solver import (
     solve_stowage,
 )
 from app.unloader import (
+    EPS,
     InfeasibleUnloading,
     PlacedContainer,
     PortWindow,
@@ -921,6 +922,487 @@ def get_unloading_sequence(db: Session, plan_id: str) -> models.UnloadingSequenc
     if sequence is None:
         raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序", 404)
     return sequence
+
+
+# ---------- 卸箱执行进度（现场逐步登记） ----------
+
+
+def _recommend_unloading_steps(container_rows, port_rows, done_nos, done_count):
+    """从当前状态求剩余推荐顺序（沿用全程箱号序列字典序最小规则）。
+
+    container_rows: (箱号, 槽位, 堆栈, 层, 箱重, 力臂, 卸港序号) 冻结快照；
+    port_rows: (卸港序号, 下限, 上限) 冻结港区间；done_nos: 已卸箱号集合；
+    done_count: 已卸步数（推荐步序从其后续排）。
+    无可行后续时抛 InfeasibleUnloading；全部卸完返回空列表。
+    """
+    remaining = [r for r in container_rows if r[0] not in done_nos]
+    if not remaining:
+        return []
+    boxes = [
+        PlacedContainer(
+            no=r[0], weight=r[4], arm=r[5], stack=r[2], tier=r[3],
+            discharge_order=r[6],
+        )
+        for r in remaining
+    ]
+    remaining_orders = {r[6] for r in remaining}
+    windows = [
+        PortWindow(
+            discharge_order=o,
+            min_remaining_moment=wmin,
+            max_remaining_moment=wmax,
+        )
+        for o, wmin, wmax in port_rows
+        if o in remaining_orders
+    ]
+    result = solve_unloading(boxes, windows)
+    slot_by_no = {r[0]: r[1] for r in container_rows}
+    recommended = []
+    for offset, st in enumerate(result.steps, start=1):
+        recommended.append({
+            "step_no": done_count + offset,
+            "discharge_order": st.discharge_order,
+            "container_no": st.container_no,
+            "slot_code": slot_by_no[st.container_no],
+            "stack": st.stack,
+            "tier": st.tier,
+            "weight": st.weight,
+            "arm": st.arm,
+            "remaining_moment": st.remaining_moment,
+        })
+    return recommended
+
+
+def _assemble_unloading_progress_out(
+    *,
+    plan_id,
+    revision_no,
+    plan_status,
+    version,
+    initial_moment,
+    container_rows,
+    port_rows,
+    done_rows,
+    recommended,
+    frozen_at,
+    created_at,
+) -> dict:
+    """纯组装：输入冻结快照与已卸步骤元组，产出 UnloadingProgressOut 字典。
+
+    登记写锁内（裸游标）与 GET 查询（ORM）共用，保证幂等快照与查询呈现一致。
+    done_rows: (步序, 操作号, 箱号, 卸港序号, 卸后剩余力矩, 期望版本, 登记时刻)。
+    """
+    info_by_no = {r[0]: r for r in container_rows}
+    done_nos = {r[2] for r in done_rows}
+    remaining_nos = sorted(no for no in info_by_no if no not in done_nos)
+    current_port = (
+        min(info_by_no[no][6] for no in remaining_nos) if remaining_nos else None
+    )
+    remaining_moment = done_rows[-1][4] if done_rows else initial_moment
+    done_steps = []
+    for step_no, op_no, cno, d_order, rem, expected, registered_at in done_rows:
+        info = info_by_no[cno]
+        done_steps.append({
+            "step_no": step_no,
+            "operation_no": op_no,
+            "container_no": cno,
+            "discharge_order": d_order,
+            "slot_code": info[1],
+            "stack": info[2],
+            "tier": info[3],
+            "weight": info[4],
+            "arm": info[5],
+            "remaining_moment": rem,
+            "expected_version": expected,
+            "registered_at": registered_at,
+        })
+    return {
+        "plan_id": plan_id,
+        "revision_no": revision_no,
+        "plan_status": plan_status,
+        "read_only": plan_status == "superseded",
+        "version": version,
+        "initial_moment": initial_moment,
+        "remaining_moment": remaining_moment,
+        "current_port": current_port,
+        "completed": not remaining_nos,
+        "remaining_containers": remaining_nos,
+        "done_steps": done_steps,
+        "recommended_steps": recommended,
+        "ports": [
+            {
+                "discharge_order": o,
+                "min_remaining_moment": wmin,
+                "max_remaining_moment": wmax,
+            }
+            for o, wmin, wmax in sorted(port_rows, key=lambda r: r[0])
+        ],
+        "frozen_at": frozen_at,
+        "created_at": created_at,
+    }
+
+
+def register_unloading_step(
+    db: Session,
+    plan_id: str,
+    payload,
+) -> tuple[dict, bool]:
+    """登记一步实际卸箱，返回 (UnloadingProgressOut 字典, 是否幂等重试命中)。
+
+    现场可选择不同于预案下一步的箱：所选箱须属于当前港（剩余箱中最小卸港
+    序号）且位于同堆栈最上层，卸后剩余力矩须落入该港原定（冻结）闭区间；
+    并须从新状态仍能按港序、堆栈先后与各港区间卸完全部剩余箱，否则说明
+    阻碍、进度不变（422）。首次登记在写锁内原子冻结当时卸箱计划（箱重/
+    力臂/港区间快照），期望版本须为 0；此后重排原计划不改已卸记录与后续
+    核算。同操作号同内容重试返回首次结果（200），异内容冲突（409）；并发
+    登记在 BEGIN IMMEDIATE 写锁内原子核对期望版本，过期或非法箱项不留下
+    部分进度。
+    """
+    plan = get_plan(db, plan_id)  # 方案不存在 -> 404（锁前预检）
+    operation_no = payload.operation_no
+    container_no = payload.container_no
+    expected_version = payload.expected_version
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 锁内复核方案状态：方案被新修订取代后进度只读
+        cursor.execute(
+            "SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,)
+        )
+        prow = cursor.fetchone()
+        if prow is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status, revision_no = prow
+        if plan_status == "draft":
+            conn.rollback()
+            raise ConflictError(
+                "方案尚未确认（draft），无已确认卸箱计划，拒绝登记卸箱执行进度"
+            )
+        if plan_status == "superseded":
+            conn.rollback()
+            raise ConflictError(
+                "方案修订已被新修订取代，其卸箱执行进度已冻结为只读，不再接受登记"
+            )
+
+        # 操作号全局唯一：同号同内容重试优先返回首次结果，异内容冲突
+        cursor.execute(
+            "SELECT p.plan_id, o.container_no, o.expected_version, "
+            "o.response_snapshot FROM unloading_progress_operations o "
+            "JOIN unloading_progress p ON p.id = o.progress_id "
+            "WHERE o.operation_no = ?",
+            (operation_no,),
+        )
+        op_row = cursor.fetchone()
+        if op_row is not None:
+            if (op_row[0] == plan_id and op_row[1] == container_no
+                    and op_row[2] == expected_version):
+                conn.commit()
+                return json.loads(op_row[3]), True
+            conn.rollback()
+            raise ConflictError(
+                f"操作号 {operation_no} 已用于一次不同的卸箱登记"
+                + ("（属于另一方案）" if op_row[0] != plan_id else
+                   f"（首次登记：箱 {op_row[1]}、期望版本 {op_row[2]}）")
+                + "，同操作号异内容冲突，本次登记被拒绝且进度不变"
+            )
+
+        # 进度头：首次登记时读取当时当前卸箱计划并冻结（校验全部通过后才落库）
+        cursor.execute(
+            "SELECT id, version, initial_moment, frozen_at, created_at "
+            "FROM unloading_progress WHERE plan_id = ?",
+            (plan_id,),
+        )
+        head = cursor.fetchone()
+        if head is None:
+            cursor.execute(
+                "SELECT id, initial_moment FROM unloading_sequences "
+                "WHERE plan_id = ? AND status = 'current'",
+                (plan_id,),
+            )
+            seq = cursor.fetchone()
+            if seq is None:
+                conn.rollback()
+                raise ConflictError(
+                    f"方案 {plan_id} 没有当前卸箱计划，须先规划逐港卸箱顺序，"
+                    "方可登记卸箱执行进度"
+                )
+            sequence_id, initial_moment = seq
+            current_version = 0
+            if expected_version != 0:
+                conn.rollback()
+                raise ConflictError(
+                    f"期望进度版本 {expected_version} 已过期：当前进度版本为 0"
+                    "（尚无已登记卸箱步骤），请按首次进度版本 0 提交，"
+                    "本次登记被拒绝且进度不变"
+                )
+            # 冻结当时卸箱计划：各箱箱重/槽位力臂/堆栈层位/卸港序号与各港原定区间
+            cursor.execute(
+                "SELECT container_no, slot_code, stack, tier, weight, arm, "
+                "discharge_order FROM unloading_steps WHERE sequence_id = ? "
+                "ORDER BY step_no",
+                (sequence_id,),
+            )
+            frozen_containers = [tuple(r) for r in cursor.fetchall()]
+            cursor.execute(
+                "SELECT discharge_order, min_remaining_moment, "
+                "max_remaining_moment FROM unloading_ports "
+                "WHERE sequence_id = ? ORDER BY discharge_order",
+                (sequence_id,),
+            )
+            frozen_ports = [tuple(r) for r in cursor.fetchall()]
+            progress_id = None
+            frozen_at = created_at = None
+            done_rows: list[tuple] = []
+        else:
+            progress_id, current_version, initial_moment, frozen_at, created_at = head
+            if expected_version != current_version:
+                conn.rollback()
+                raise ConflictError(
+                    f"期望进度版本 {expected_version} 已过期：当前进度版本为 "
+                    f"{current_version}，请基于最新进度重新提交，"
+                    "本次登记被拒绝且进度不变"
+                )
+            cursor.execute(
+                "SELECT container_no, slot_code, stack, tier, weight, arm, "
+                "discharge_order FROM unloading_progress_containers "
+                "WHERE progress_id = ?",
+                (progress_id,),
+            )
+            frozen_containers = [tuple(r) for r in cursor.fetchall()]
+            cursor.execute(
+                "SELECT discharge_order, min_remaining_moment, "
+                "max_remaining_moment FROM unloading_progress_ports "
+                "WHERE progress_id = ?",
+                (progress_id,),
+            )
+            frozen_ports = [tuple(r) for r in cursor.fetchall()]
+            cursor.execute(
+                "SELECT step_no, operation_no, container_no, discharge_order, "
+                "remaining_moment, expected_version, registered_at "
+                "FROM unloading_progress_steps WHERE progress_id = ? "
+                "ORDER BY step_no",
+                (progress_id,),
+            )
+            done_rows = [
+                (r[0], r[1], r[2], r[3], r[4], r[5], utc_iso(_raw_dt(r[6])))
+                for r in cursor.fetchall()
+            ]
+            frozen_at = utc_iso(_raw_dt(frozen_at))
+            created_at = utc_iso(_raw_dt(created_at))
+
+        # 所选箱合法性（任一不满足均回滚，不留部分进度）
+        info_by_no = {r[0]: r for r in frozen_containers}
+        done_nos = {r[2] for r in done_rows}
+        target = info_by_no.get(container_no)
+        if target is None:
+            conn.rollback()
+            raise BusinessError(
+                f"箱 {container_no} 不在方案 {plan_id} 的卸箱计划中，"
+                "本次登记被拒绝且进度不变",
+                422,
+            )
+        if container_no in done_nos:
+            done_step = next(r[0] for r in done_rows if r[2] == container_no)
+            conn.rollback()
+            raise BusinessError(
+                f"箱 {container_no} 已在第 {done_step} 步卸下，不得重复卸箱，"
+                "本次登记被拒绝且进度不变",
+                422,
+            )
+        remaining = [r for r in frozen_containers if r[0] not in done_nos]
+        current_port = min(r[6] for r in remaining)
+        if target[6] != current_port:
+            conn.rollback()
+            raise BusinessError(
+                f"箱 {container_no} 属于卸港 {target[6]}，当前港为卸港 "
+                f"{current_port}（剩余箱中最小卸港序号），须先卸当前港的箱，"
+                "本次登记被拒绝且进度不变",
+                422,
+            )
+        above = sorted(
+            (r[0], r[3]) for r in remaining
+            if r[2] == target[2] and r[3] > target[3]
+        )
+        if above:
+            conn.rollback()
+            raise BusinessError(
+                f"箱 {container_no} 上方同堆栈 {target[2]} 还有未卸箱 "
+                f"{above[0][0]}（第 {above[0][1]} 层），须先卸上层箱，"
+                "本次登记被拒绝且进度不变",
+                422,
+            )
+        current_remaining = initial_moment - sum(
+            info_by_no[r[2]][4] * info_by_no[r[2]][5] for r in done_rows
+        )
+        new_remaining = current_remaining - target[4] * target[5]
+        window = {p[0]: p for p in frozen_ports}[current_port]
+        if not (window[1] - EPS <= new_remaining <= window[2] + EPS):
+            conn.rollback()
+            raise BusinessError(
+                f"卸下箱 {container_no} 后剩余总力矩 {round(new_remaining, 6)} "
+                f"不在卸港 {current_port} 的原定允许区间 "
+                f"[{window[1]}, {window[2]}] 内，本次登记被拒绝且进度不变",
+                422,
+            )
+
+        # 从新状态必须仍能按港序、堆栈先后与各港力矩区间卸完全部剩余箱；
+        # 可行时即得按全程箱号字典序规则的剩余推荐顺序
+        try:
+            recommended = _recommend_unloading_steps(
+                frozen_containers, frozen_ports,
+                done_nos | {container_no}, current_version + 1,
+            )
+        except InfeasibleUnloading as exc:
+            conn.rollback()
+            raise BusinessError(
+                f"卸下箱 {container_no} 后将无法按港序、堆栈先后与各港力矩区间"
+                f"卸完全部剩余箱：{exc.reason}；本次登记被拒绝且进度不变",
+                422,
+            )
+
+        # 全部校验通过：原子登记该步并推进进度版本（首次登记同时落冻结快照）
+        new_version = current_version + 1
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        if progress_id is None:
+            cursor.execute(
+                "INSERT INTO unloading_progress "
+                "(plan_id, version, initial_moment, frozen_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (plan_id, new_version, initial_moment, now, now),
+            )
+            progress_id = cursor.lastrowid
+            cursor.executemany(
+                "INSERT INTO unloading_progress_containers "
+                "(progress_id, container_no, slot_code, stack, tier, weight, "
+                "arm, discharge_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [(progress_id, *r) for r in frozen_containers],
+            )
+            cursor.executemany(
+                "INSERT INTO unloading_progress_ports "
+                "(progress_id, discharge_order, min_remaining_moment, "
+                "max_remaining_moment) VALUES (?, ?, ?, ?)",
+                [(progress_id, *r) for r in frozen_ports],
+            )
+            frozen_at = created_at = utc_iso(_raw_dt(now))
+        else:
+            cursor.execute(
+                "UPDATE unloading_progress SET version = ? WHERE id = ?",
+                (new_version, progress_id),
+            )
+        stored_remaining = round(new_remaining, 6)
+        cursor.execute(
+            "INSERT INTO unloading_progress_steps "
+            "(progress_id, step_no, operation_no, container_no, discharge_order, "
+            "remaining_moment, expected_version, registered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (progress_id, new_version, operation_no, container_no, current_port,
+             stored_remaining, expected_version, now),
+        )
+        cursor.execute(
+            "INSERT INTO unloading_progress_operations "
+            "(progress_id, operation_no, container_no, expected_version, "
+            "from_version, to_version, response_snapshot, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, '', ?)",
+            (progress_id, operation_no, container_no, expected_version,
+             current_version, new_version, now),
+        )
+        operation_id = cursor.lastrowid
+
+        done_rows_out = done_rows + [(
+            new_version, operation_no, container_no, current_port,
+            stored_remaining, expected_version, utc_iso(_raw_dt(now)),
+        )]
+        out = _assemble_unloading_progress_out(
+            plan_id=plan_id,
+            revision_no=revision_no,
+            plan_status=plan_status,
+            version=new_version,
+            initial_moment=initial_moment,
+            container_rows=frozen_containers,
+            port_rows=frozen_ports,
+            done_rows=done_rows_out,
+            recommended=recommended,
+            frozen_at=frozen_at,
+            created_at=created_at,
+        )
+        # 回填幂等快照：同操作号同内容重试返回首次结果
+        cursor.execute(
+            "UPDATE unloading_progress_operations SET response_snapshot = ? "
+            "WHERE id = ?",
+            (json.dumps(out, ensure_ascii=False), operation_id),
+        )
+        conn.commit()
+        return out, False
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_unloading_progress(db: Session, plan_id: str) -> models.UnloadingProgress:
+    # 方案须存在（不存在给 404 方案错误），进度头不存在给 404 进度错误
+    get_plan(db, plan_id)
+    progress = db.scalar(
+        select(models.UnloadingProgress).where(
+            models.UnloadingProgress.plan_id == plan_id
+        )
+    )
+    if progress is None:
+        raise BusinessError(f"方案 {plan_id} 尚无卸箱执行进度登记", 404)
+    return progress
+
+
+def build_unloading_progress_out(
+    db: Session, progress: models.UnloadingProgress
+) -> dict:
+    """ORM 路径组装进度视图：已卸步骤、当前港、剩余力矩、版本与剩余推荐顺序。"""
+    container_rows = [
+        (c.container_no, c.slot_code, c.stack, c.tier, c.weight, c.arm,
+         c.discharge_order)
+        for c in progress.containers
+    ]
+    port_rows = [
+        (p.discharge_order, p.min_remaining_moment, p.max_remaining_moment)
+        for p in progress.ports
+    ]
+    done_rows = [
+        (s.step_no, s.operation_no, s.container_no, s.discharge_order,
+         s.remaining_moment, s.expected_version, utc_iso(s.registered_at))
+        for s in sorted(progress.steps, key=lambda x: x.step_no)
+    ]
+    done_nos = {r[2] for r in done_rows}
+    try:
+        recommended = _recommend_unloading_steps(
+            container_rows, port_rows, done_nos, progress.version
+        )
+    except InfeasibleUnloading as exc:  # 防御：已登记状态在登记时已验证可行
+        raise BusinessError(f"剩余推荐顺序求解失败：{exc.reason}", 500)
+    return _assemble_unloading_progress_out(
+        plan_id=progress.plan_id,
+        revision_no=progress.plan.revision_no,
+        plan_status=progress.plan.status,
+        version=progress.version,
+        initial_moment=progress.initial_moment,
+        container_rows=container_rows,
+        port_rows=port_rows,
+        done_rows=done_rows,
+        recommended=recommended,
+        frozen_at=utc_iso(progress.frozen_at),
+        created_at=utc_iso(progress.created_at),
+    )
 
 
 # ---------- 装船实绩登记（事件重放） ----------

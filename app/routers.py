@@ -32,6 +32,8 @@ from app.schemas import (
     UnloadingCreateIn,
     UnloadingOut,
     UnloadingPortOut,
+    UnloadingProgressOut,
+    UnloadingProgressRegisterIn,
     UnloadingStepOut,
 )
 
@@ -368,6 +370,39 @@ def list_unloading_sequences(
 )
 def get_unloading_sequence(plan_id: str, db: Session = Depends(get_db)):
     return _unloading_out(services.get_unloading_sequence(db, plan_id))
+
+
+# ---------- 卸箱执行进度（现场逐步登记） ----------
+
+
+@router.post(
+    "/plans/{plan_id}/unloading-progress",
+    response_model=UnloadingProgressOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="登记一步实际卸箱（现场可偏离预案下一步；首次登记冻结卸箱计划与港区间）",
+)
+def register_unloading_progress(
+    plan_id: str,
+    body: UnloadingProgressRegisterIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    out, idempotent_hit = services.register_unloading_step(db, plan_id, body)
+    # 同操作号同内容重试返回首次结果（200）；新一步登记成功为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return out
+
+
+@router.get(
+    "/plans/{plan_id}/unloading-progress",
+    response_model=UnloadingProgressOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询卸箱执行进度：已卸步骤、当前港、剩余力矩、进度版本与剩余推荐顺序",
+)
+def get_unloading_progress(plan_id: str, db: Session = Depends(get_db)):
+    progress = services.get_unloading_progress(db, plan_id)
+    return services.build_unloading_progress_out(db, progress)
 
 
 # ---------- 装船实绩登记（事件重放） ----------
